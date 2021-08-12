@@ -1,6 +1,6 @@
 module github.com/cloudflare/cloudflared
 
-go 1.15
+go 1.16
 
 require (
 	github.com/certifi/gocertifi v0.0.0-20200211180108-c7c1fbc02894 // indirect
