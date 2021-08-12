@@ -1,9 +1,11 @@
 package access
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -11,18 +13,17 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/getsentry/raven-go"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
-	"github.com/urfave/cli/v2"
-	"golang.org/x/net/idna"
-
 	"github.com/cloudflare/cloudflared/carrier"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/sshgen"
 	"github.com/cloudflare/cloudflared/token"
 	"github.com/cloudflare/cloudflared/validation"
+	"github.com/getsentry/raven-go"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -99,6 +100,59 @@ func Commands() []*cli.Command {
 					header when using curl to reach an application behind Access.`,
 					ArgsUsage:       "allow-request will allow the curl request to continue even if the jwt is not present.",
 					SkipFlagParsing: true,
+				},
+				{
+					Name:        "proxy",
+					Action:      cliutil.Action(proxy),
+					Usage:       "",
+					Description: ``,
+					ArgsUsage:   "",
+					Flags: []cli.Flag{
+						&cli.StringFlag{
+							Name:    sshHostnameFlag,
+							Aliases: []string{"tunnel-host", "T"},
+							Usage:   "specify the hostname of your application.",
+						},
+						&cli.StringFlag{
+							Name:  sshDestinationFlag,
+							Usage: "specify the destination address of your SSH server.",
+						},
+						&cli.StringFlag{
+							Name:    sshURLFlag,
+							Aliases: []string{"listener", "L"},
+							Usage:   "specify the host:port to forward data to Cloudflare edge.",
+						},
+						&cli.StringSliceFlag{
+							Name:    sshHeaderFlag,
+							Aliases: []string{"H"},
+							Usage:   "specify additional headers you wish to send.",
+						},
+						&cli.StringFlag{
+							Name:    sshTokenIDFlag,
+							Aliases: []string{"id"},
+							Usage:   "specify an Access service token ID you wish to use.",
+						},
+						&cli.StringFlag{
+							Name:    sshTokenSecretFlag,
+							Aliases: []string{"secret"},
+							Usage:   "specify an Access service token secret you wish to use.",
+						},
+						&cli.StringFlag{
+							Name:    logger.LogSSHDirectoryFlag,
+							Aliases: []string{"logfile"}, //added to match the tunnel side
+							Usage:   "Save application log to this directory for reporting issues.",
+						},
+						&cli.StringFlag{
+							Name:    logger.LogSSHLevelFlag,
+							Aliases: []string{"loglevel"}, //added to match the tunnel side
+							Usage:   "Application logging level {debug, info, warn, error, fatal}. ",
+						},
+						&cli.StringFlag{
+							Name:   sshConnectTo,
+							Hidden: true,
+							Usage:  "Connect to alternate location for testing, value is host, host:port, or sni:port:host",
+						},
+					},
 				},
 				{
 					Name:        "token",
@@ -246,6 +300,102 @@ func ensureURLScheme(url string) string {
 
 	}
 	return url
+}
+
+// proxy provides a http server to proxy requests to cloudflare access with it's
+// JWT
+func proxy(c *cli.Context) error {
+	log := logger.CreateSSHLoggerFromContext(c, logger.EnableTerminalLog)
+
+	// get the hostname from the cmdline and error out if its not provided
+	rawHostName := c.String(sshHostnameFlag)
+	hostname, err := validation.ValidateHostname(rawHostName)
+	if err != nil || rawHostName == "" {
+		return cli.ShowCommandHelp(c, "ssh")
+	}
+	originURL := ensureURLScheme(hostname)
+
+	// get the headers from the cmdline and add them
+	headers := buildRequestHeaders(c.StringSlice(sshHeaderFlag))
+	if c.IsSet(sshTokenIDFlag) {
+		headers.Set(cfAccessClientIDHeader, c.String(sshTokenIDFlag))
+	}
+	if c.IsSet(sshTokenSecretFlag) {
+		headers.Set(cfAccessClientSecretHeader, c.String(sshTokenSecretFlag))
+	}
+
+	carrier.SetBastionDest(headers, c.String(sshDestinationFlag))
+
+	options := &carrier.StartOptions{
+		OriginURL: originURL,
+		Headers:   headers,
+		Host:      hostname,
+	}
+
+	if connectTo := c.String(sshConnectTo); connectTo != "" {
+		parts := strings.Split(connectTo, ":")
+		switch len(parts) {
+		case 1:
+			options.OriginURL = fmt.Sprintf("https://%s", parts[0])
+		case 2:
+			options.OriginURL = fmt.Sprintf("https://%s:%s", parts[0], parts[1])
+		case 3:
+			options.OriginURL = fmt.Sprintf("https://%s:%s", parts[2], parts[1])
+			options.TLSClientConfig = &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         parts[0],
+			}
+			log.Warn().Msgf("Using insecure SSL connection because SNI overridden to %s", parts[0])
+		default:
+			return fmt.Errorf("invalid connection override: %s", connectTo)
+		}
+	}
+
+	appURL, err := url.Parse(options.OriginURL)
+	if err != nil {
+		return err
+	}
+	appInfo, err := token.GetAppInfo(appURL)
+	if err != nil {
+		return err
+	}
+	tok, err := token.GetAppTokenIfExists(appInfo)
+	if err != nil || tok == "" {
+		tok, err = token.FetchToken(appURL, appInfo, log)
+		if err != nil {
+			log.Err(err).Msg("Failed to refresh token")
+			return err
+		}
+	}
+
+	origin, err := url.Parse(options.OriginURL)
+	if err != nil {
+		log.Fatal().Err(err)
+		return err
+	}
+
+	listener := c.String(sshURLFlag)
+	listenerURL, err := url.Parse(listener)
+	log.Error().Err(err)
+
+	proxy := &httputil.ReverseProxy{Director: func(req *http.Request) {
+		originHost := origin.Host
+
+		req.Header.Add("X-Forwarded-Host", req.Host)
+		req.Header.Add("X-Origin-Host", originHost)
+		req.Header.Add(carrier.CFAccessTokenHeader, tok)
+
+		req.Host = originHost
+		req.URL.Scheme = origin.Scheme
+		req.URL.Host = originHost
+	}}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	})
+	log.Info().Msg(fmt.Sprintf("Listening on: '%s'", listenerURL))
+
+	return http.ListenAndServe(listener, nil)
 }
 
 // curl provides a wrapper around curl, passing Access JWT along in request
